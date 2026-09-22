@@ -1,0 +1,13 @@
+services:
+  web:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - BATTERY_DB=/app/data/battery.db
+    volumes:
+      - battery-data:/app/data
+    restart: unless-stopped
+
+volumes:
+  battery-data:

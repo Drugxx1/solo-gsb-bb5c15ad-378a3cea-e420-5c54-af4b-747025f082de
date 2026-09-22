@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>无人机电池循环健康评估</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>🛩️ 无人机电池循环健康评估</h1>
+  <span class="subtitle">导入飞行日志 CSV · 状态机循环识别 · 库仑积分容量 · 内阻与温升判定</span>
+</header>
+
+<div id="layout">
+  <aside>
+    <h2>电池列表</h2>
+    <ul id="battery-list"></ul>
+    <form id="battery-form">
+      <h3>新建电池</h3>
+      <label>名称<input name="name" required placeholder="如：6S 锂电 #1"></label>
+      <label>额定容量 (Ah)<input name="rated_capacity_ah" type="number" step="0.01" min="0.01" required placeholder="如：2.2"></label>
+      <label>安全电压下限 (V)<input name="safe_voltage_min" type="number" step="0.01" min="0" required placeholder="如：19.8"></label>
+      <label>安全电压上限 (V)<input name="safe_voltage_max" type="number" step="0.01" min="0" required placeholder="如：25.2"></label>
+      <label>备注<input name="notes" placeholder="可选"></label>
+      <button type="submit">创建</button>
+    </form>
+  </aside>
+
+  <main>
+    <section id="empty-tip" class="card">← 请选择或新建一块电池开始评估。</section>
+
+    <section id="battery-view" hidden>
+      <div class="card" id="battery-head">
+        <div class="head-row">
+          <h2 id="b-name"></h2>
+          <div class="actions">
+            <button id="btn-export" class="secondary">导出评估 JSON</button>
+            <button id="btn-delete" class="danger">删除电池</button>
+          </div>
+        </div>
+        <form id="settings-form" class="inline-form">
+          <label>额定容量 (Ah)<input name="rated_capacity_ah" type="number" step="0.01" min="0.01" required></label>
+          <label>安全电压下限 (V)<input name="safe_voltage_min" type="number" step="0.01" min="0" required></label>
+          <label>安全电压上限 (V)<input name="safe_voltage_max" type="number" step="0.01" min="0" required></label>
+          <button type="submit" class="secondary">保存设置</button>
+        </form>
+        <p class="muted" id="b-meta"></p>
+      </div>
+
+      <div class="card">
+        <h3>导入飞行日志</h3>
+        <div class="upload-row">
+          <input type="file" id="csv-file" accept=".csv,text/csv">
+          <button id="btn-upload">上传并分析</button>
+        </div>
+        <p class="muted">CSV 需包含表头与四列：时间（ISO 时间戳或秒）、电压 V、电流 A（放电为正）、温度 °C。
+        支持常见中英文列名与逗号/分号/制表符分隔。可选单体电压列 <code>cell1_voltage,cell2_voltage…</code>
+        （亦接受 <code>单体1电压 / 电芯电压1 / 第1节电压 / v1</code> 等表头），编号须从 1 连续；
+        某行缺值或单体数漂移时仅跳过该行单体分析，不影响总压循环分析。
+        导入前会自动执行<strong>数据质量审计</strong>（时间戳乱序 / 重复 / 异常间隔、电压电流温度
+        稳健离群点），审计只生成证据，绝不阻断可解析行的循环分析。</p>
+        <p id="upload-result" class="muted"></p>
+      </div>
+
+      <div class="card" id="assessment-card" hidden>
+        <h3>健康评估</h3>
+        <div id="summary-cards"></div>
+        <p id="summary-text" class="summary-text"></p>
+        <h4>容量趋势（放电循环）</h4>
+        <canvas id="trend-chart" height="200"></canvas>
+        <h4>导入数据质量摘要</h4>
+        <div id="quality-summary"></div>
+        <h4>判定标记 <span class="muted" id="flag-count"></span></h4>
+        <ul id="flag-list" class="flags"></ul>
+      </div>
+
+      <div class="card">
+        <h3>已导入日志</h3>
+        <table id="logs-table">
+          <thead><tr>
+            <th>ID</th><th>文件名</th><th>导入时间</th><th>时长</th>
+            <th>行数</th><th>放电/充电循环</th><th>数据质量</th><th></th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <div class="card" id="log-detail" hidden>
+        <h3 id="log-title"></h3>
+        <canvas id="log-chart" height="320"></canvas>
+        <div id="chart-legend" class="legend"></div>
+        <div id="quality-panel" hidden>
+          <h4>导入前数据质量审计 <span class="muted" id="quality-panel-sub"></span></h4>
+          <div id="quality-metrics" class="quality-metrics"></div>
+          <div class="quality-filters" id="quality-filters"></div>
+          <ul id="quality-segments" class="qlist"></ul>
+        </div>
+        <h4>循环明细</h4>
+        <table id="cycles-table">
+          <thead><tr>
+            <th>#</th><th>类型</th><th>开始</th><th>时长</th><th>容量 (Ah)</th>
+            <th>能量 (Wh)</th><th>均流 (A)</th><th>电压范围 (V)</th>
+            <th>最高温 (°C)</th><th>温升 (°C)</th><th>内阻 (mΩ)</th>
+            <th>单体压差</th><th>状态</th>
+          </tr></thead>
+          <tbody></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+</div>
+
+<div id="toast"></div>
+<script src="/static/app.js"></script>
+</body>
+</html>
