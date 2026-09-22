@@ -232,3 +232,19 @@ canvas { width: 100%; background: #121829; border-radius: 8px; }
   max-height: 220px; overflow: auto;
 }
 .qlegend .dot { vertical-align: middle; }
+
+/* ---------------- 放电容量可信覆盖 ---------------- */
+.cov-cell { white-space: nowrap; }
+a.cov-toggle { cursor: pointer; text-decoration: none; }
+a.cov-toggle:hover { filter: brightness(1.2); }
+tr.cov-detail-row { cursor: default; }
+tr.cov-detail-row:hover { background: inherit; }
+tr.cov-detail-row > td { text-align: left; background: #0d1322; }
+.cov-detail { padding: 6px 4px; font-size: 12.5px; line-height: 1.7; }
+.cov-headline { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 6px; }
+.cov-cols { display: grid; grid-template-columns: 2fr 1fr; gap: 14px; }
+.cov-segs { margin: 4px 0 0; padding-left: 18px; }
+.cov-segs li { margin-bottom: 6px; }
+.cov-reasons { color: #c8a23a; margin-top: 2px; }
+.cov-reason { font-size: 12px; }
+@media (max-width: 900px) { .cov-cols { grid-template-columns: 1fr; } }

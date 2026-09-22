@@ -227,6 +227,16 @@ $("#btn-upload").onclick = async () => {
       }
     }
     msg += formatAuditOneLine(r.quality_audit);
+    const covs = r.cycles
+      .filter((c) => c.kind === "discharge" && c.coverage && c.coverage.assessable)
+      .map((c) => c.coverage);
+    if (covs.length) {
+      const lowC = covs.filter((cv) => cv.status === "low_coverage").length;
+      const minRatio = Math.min(...covs.map((cv) => cv.trusted_time_ratio || 0));
+      msg += lowC
+        ? `容量可信覆盖：${lowC}/${covs.length} 个放电循环可信时长占比低于 90%（最低 ${Math.round(minRatio * 100)}%）。`
+        : `容量可信覆盖：${covs.length} 个放电循环均≥90% 可信时长（最低 ${Math.round(minRatio * 100)}%）。`;
+    }
     $("#upload-result").textContent = msg;
     input.value = "";
     await Promise.all([loadAssessment(), loadLogs(), loadBatteries(true)]);
@@ -312,6 +322,7 @@ async function loadAssessment() {
 
   drawTrend(a.trend, a.battery.rated_capacity_ah);
   renderQualitySummary(a.data_quality, a.logs);
+  renderCapacityCoverage(a.capacity_coverage);
 }
 
 function renderQualitySummary(dq, logs) {
@@ -383,12 +394,127 @@ function renderCyclesTable(cycles) {
       <td>${fmt(c.max_temp_c, 1)}</td><td>${fmt(c.temp_rise_c, 1)}</td>
       <td>${c.ir_mohm !== null ? fmt(c.ir_mohm, 1) : "—"}</td>
       <td>${cellTxt}</td>
+      <td class="cov-cell">${coverageBadgeHtml(c.coverage, c.kind)}</td>
       <td>${stateTag}${flagTxt}</td>`;
     tbody.appendChild(tr);
+    const detailTr = buildCoverageDetailRow(c, 14);
+    if (detailTr) {
+      tbody.appendChild(detailTr);
+      const badge = tr.querySelector(".cov-toggle");
+      if (badge) badge.onclick = (e) => {
+        e.stopPropagation();
+        detailTr.hidden = !detailTr.hidden;
+      };
+    }
   }
   if (!cycles.length) {
-    tbody.innerHTML = `<tr><td colspan="13" class="muted">未识别到完整充放电循环。</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="14" class="muted">未识别到完整充放电循环。</td></tr>`;
   }
+}
+
+/* ---------------- 放电容量可信覆盖 ---------------- */
+
+function coverageBadgeHtml(cov, kind) {
+  if (kind !== "discharge") return `<span class="muted">—</span>`;
+  if (!cov || cov.status === "unassessed") {
+    return `<a class="qbadge fair cov-toggle" title="点击查看">无法评估</a>`;
+  }
+  const pct = Math.round((cov.trusted_time_ratio || 0) * 100);
+  const cls = cov.status === "low_coverage" ? "fair" : "good";
+  return `<a class="qbadge ${cls} cov-toggle" title="点击查看可疑段原始行号与原因">` +
+    `${pct}%${cov.status === "low_coverage" ? " ⚠低覆盖" : " 可信"}</a>`;
+}
+
+function buildCoverageDetailRow(c, colspan) {
+  if (c.kind !== "discharge" || !c.coverage) return null;
+  const cov = c.coverage;
+  const tr = document.createElement("tr");
+  tr.className = "cov-detail-row";
+  tr.hidden = true;
+  const td = document.createElement("td");
+  td.colSpan = colspan;
+  if (cov.status === "unassessed") {
+    td.innerHTML = `<div class="cov-detail">
+      <span class="qbadge fair">无法评估</span>
+      <span>${cov.reason || "该循环无法评估容量可信覆盖"}，不能视为全部可信。</span>
+    </div>`;
+    tr.appendChild(td);
+    return tr;
+  }
+  const pct = Math.round((cov.trusted_time_ratio || 0) * 100);
+  const sus = cov.suspicious_segments || [];
+  const susItems = sus.length
+    ? sus.map((g) => {
+        const reasons = (g.reasons || []).map((m) => `<div class="cov-reason">· ${m}</div>`).join("");
+        return `<li>原始行号 <strong>第 ${g.line_start} ~ ${g.line_end} 行</strong>` +
+          `（t=${fmt(g.start_t, 0)}s ~ ${fmt(g.end_t, 0)}s），` +
+          `时长 ${fmtDur(g.duration_s)}，该段梯形积分 ${fmt(g.capacity_ah, 4)}Ah` +
+          `<div class="cov-reasons">${reasons}</div></li>`;
+      }).join("")
+    : `<li class="muted">无可疑段，全部积分段均落在可信采样区间。</li>`;
+  td.innerHTML = `<div class="cov-detail">
+    <div class="cov-headline">
+      <span class="qbadge ${cov.status === "low_coverage" ? "fair" : "good"}">
+        可信时长占比 ${pct}%（阈值 ${Math.round((cov.low_coverage_threshold || 0.9) * 100)}%）</span>
+      <span class="muted">逐梯形段重算：循环总容量 ${fmt(cov.total_capacity_ah, 4)}Ah
+        ＝ 可信段 ${fmt(cov.trusted_capacity_ah, 4)}Ah ＋ 可疑段 ${fmt(cov.suspicious_capacity_ah, 4)}Ah；
+        总时长 ${fmtDur(cov.total_duration_s)} ＝ 可信 ${fmtDur(cov.trusted_duration_s)}
+        ＋ 可疑 ${fmtDur(cov.suspicious_duration_s)}（${cov.suspicious_intervals} 个积分段）。
+        上方循环容量 ${fmt(c.capacity_ah, 3)}Ah 仍为原值，可信段容量不代表真实总容量。</span>
+    </div>
+    <div class="cov-cols">
+      <div><strong>可疑段</strong>（电流离群点相邻区间 / 采样缺口区间）<ul class="cov-segs">${susItems}</ul>
+        ${cov.suspicious_segments_truncated ? `<div class="muted">可疑段数量较多，仅展示前 ${sus.length} 段，汇总统计不受影响。</div>` : ""}
+      </div>
+      <div><strong>可信段</strong><ul class="cov-segs">
+        <li class="muted">${(cov.trusted_segments || []).length} 段，
+          合计 ${fmt(cov.trusted_capacity_ah, 4)}Ah / ${fmtDur(cov.trusted_duration_s)}
+          ${cov.trusted_segments_truncated ? "（明细已截断）" : ""}</li>
+      </ul></div>
+    </div>
+  </div>`;
+  tr.appendChild(td);
+  return tr;
+}
+
+function renderCapacityCoverage(cc) {
+  const section = $("#coverage-section");
+  const el = $("#capacity-coverage");
+  if (!cc || !cc.discharge_cycles) { section.hidden = true; el.innerHTML = ""; return; }
+  section.hidden = false;
+  const low = cc.low_coverage_cycles || [];
+  const unknown = cc.unassessed_cycles || [];
+  const ratioTxt = cc.min_trusted_time_ratio !== null
+    ? Math.round(cc.min_trusted_time_ratio * 100) + "%" : "—";
+  const metrics = [
+    ["放电循环", cc.discharge_cycles, ""],
+    ["可评估覆盖", cc.assessable_cycles, unknown.length ? "fair" : "good"],
+    ["最低可信时长占比", ratioTxt, cc.low_coverage_cycles.length ? "fair" : "good"],
+    ["低覆盖循环（<90%）", low.length, low.length ? "fair" : "good"],
+    ["无法评估循环", unknown.length, unknown.length ? "fair" : "good"],
+  ];
+  const lowHtml = low.length
+    ? `<ul class="flags">${low.map((c) => `<li class="warning">
+        <span class="badge">低覆盖</span>日志 #${c.log_id} 放电循环 #${c.cycle_seq}
+        （容量 ${fmt(c.capacity_ah, 3)}Ah）可信时长占比
+        ${Math.round((c.trusted_time_ratio || 0) * 100)}%，可疑段容量
+        ${fmt(c.suspicious_capacity_ah, 4)}Ah / ${fmtDur(c.suspicious_duration_s)}
+        ${c.start_iso ? " · " + fmtTime(c.start_iso) : ""}
+        <span class="evidence">原因：${(c.reasons || []).join("、") || "采样缺口/电流离群"}；
+        完整原始行号见日志详情循环明细</span></li>`).join("")}</ul>`
+    : `<p class="muted">可评估的放电循环可信时长占比均不低于 ${Math.round((cc.threshold || 0.9) * 100)}%。</p>`;
+  const unknownHtml = unknown.length
+    ? `<ul class="flags">${unknown.map((c) => `<li class="info">
+        <span class="badge">无法评估</span>日志 #${c.log_id} 放电循环 #${c.cycle_seq}
+        （容量 ${fmt(c.capacity_ah, 3)}Ah）：${c.reason}，不能视为全部可信。</li>`).join("")}</ul>`
+    : "";
+  el.innerHTML = `<div class="quality-metrics">${metrics.map(([k, v, cls]) =>
+    `<div class="metric"><div class="k">${k}</div><div class="v ${cls}">${v}</div></div>`).join("")}</div>
+    ${lowHtml}${unknownHtml}
+    <p class="muted">覆盖评估以 CSV 原始行号关联质量审计与样本，对放电循环逐梯形积分段重算：
+    电流稳健离群点的相邻积分段与采样缺口跨段计为可疑段，其余为可信段；
+    各循环的容量、SOH 与健康等级维持原值不变，导出 JSON 见
+    <code>capacity_coverage</code> 与 <code>cycles[].coverage</code>。</p>`;
 }
 
 /* ---------------- 日志质量审计面板 ---------------- */
@@ -673,11 +799,22 @@ function drawTrend(trend, ratedAh) {
   }
   trend.forEach((p, k) => {
     const cx = padL + ((k + 0.5) / trend.length) * iw;
-    ctx.fillStyle = "#4da3ff";
+    let barColor = "#4da3ff";
+    if (p.coverage_status === "low_coverage") barColor = "#ffa726";
+    else if (p.coverage_status === "unassessed") barColor = "#6b7591";
+    ctx.fillStyle = barColor;
     ctx.fillRect(cx - bw / 2, y(p.capacity_ah), bw, ih - (y(p.capacity_ah) - padT));
     ctx.fillStyle = "#8a97b5";
     ctx.fillText(`#${p.n}`, cx - 8, H - 8);
     ctx.fillText(p.capacity_ah.toFixed(2), cx - 14, y(p.capacity_ah) - 4);
+    // 容量可信覆盖角标：低覆盖显示可信时长占比，无法评估显示 ?
+    if (p.coverage_status === "low_coverage") {
+      ctx.fillStyle = "#ffa726";
+      ctx.fillText(`${Math.round((p.trusted_time_ratio || 0) * 100)}%`, cx - 9, y(p.capacity_ah) + 12);
+    } else if (p.coverage_status === "unassessed") {
+      ctx.fillStyle = "#6b7591";
+      ctx.fillText("?", cx - 2, y(p.capacity_ah) + 12);
+    }
   });
   // 额定容量参考线
   ctx.strokeStyle = "#f0b429";
@@ -686,6 +823,26 @@ function drawTrend(trend, ratedAh) {
   ctx.setLineDash([]);
   ctx.fillStyle = "#f0b429";
   ctx.fillText(`额定 ${ratedAh}Ah`, W - padR - 76, y(ratedAh) - 5);
+  // 可信覆盖图例
+  const covLow = trend.some((p) => p.coverage_status === "low_coverage");
+  const covUnknown = trend.some((p) => p.coverage_status === "unassessed");
+  if (covLow || covUnknown) {
+    ctx.font = "10px monospace";
+    let lx = padL;
+    if (covLow) {
+      ctx.fillStyle = "#ffa726";
+      ctx.fillRect(lx, H - 22, 8, 8);
+      ctx.fillStyle = "#8a97b5";
+      ctx.fillText("低可信覆盖（柱内为可信时长占比）", lx + 11, H - 14);
+      lx += 190;
+    }
+    if (covUnknown) {
+      ctx.fillStyle = "#6b7591";
+      ctx.fillRect(lx, H - 22, 8, 8);
+      ctx.fillStyle = "#8a97b5";
+      ctx.fillText("无法评估（旧库无审计，非全可信）", lx + 11, H - 14);
+    }
+  }
 }
 
 /* ---------------- 启动 ---------------- */

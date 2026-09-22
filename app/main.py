@@ -12,8 +12,11 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from urllib.parse import quote
 
-from .analysis import (build_assessment, detect_cycles, evaluate_cycle,
-                       evaluate_cell_balance)
+from .analysis import (Sample, build_assessment, detect_cycles,
+                       evaluate_cycle, evaluate_cell_balance)
+from .coverage import (LOW_COVERAGE_TIME_RATIO, STATUS_UNASSESSED,
+                       assess_cycle_coverage, build_coverage_plan,
+                       unknown_coverage)
 from .database import get_conn, init_db
 from .importer import CsvFormatError, decode_text, parse_flight_csv
 
@@ -75,6 +78,59 @@ def _quality_brief(audit: Optional[str]) -> Optional[dict]:
         "affected_fields": data.get("affected_fields", []),
         "skipped_rows": data.get("skipped_rows", 0),
     }
+
+
+def _load_samples_for_coverage(conn, log_id: int) -> list[Sample]:
+    """加载某日志全部样本（时间序），用于旧库循环的可信覆盖惰性重算。"""
+    rows = conn.execute(
+        "SELECT t, current, line_no FROM samples WHERE log_id=? ORDER BY t",
+        (log_id,)).fetchall()
+    return [Sample(t=r["t"], v=0.0, i=r["current"], temp=0.0, cells=None,
+                   line_no=r["line_no"])
+            for r in rows]
+
+
+def _attach_legacy_coverage(conn, cycles: list[dict],
+                            audits_by_log: dict[int, Optional[dict]]) -> None:
+    """对旧库（cycles.coverage 为空）的放电循环按原始行号惰性重算覆盖评估。
+
+    - 有审计记录：加载该日志样本，用导入时同一份审计证据重算；
+    - 无审计记录：标记 unassessed（无法评估，不得视为全可信）。
+    """
+    pending: dict[int, list[dict]] = {}
+    for c in cycles:
+        if c.get("coverage") is not None or c["kind"] != "discharge":
+            continue
+        pending.setdefault(c["log_id"], []).append(c)
+    for log_id, cs in pending.items():
+        audit = audits_by_log.get(log_id)
+        if audit is None:
+            for c in cs:
+                cov = unknown_coverage(
+                    "该日志为旧版导入，无导入前质量审计记录，"
+                    "无法评估容量可信覆盖（不得视为全部可信）")
+                c["coverage"] = cov
+            continue
+        samples = _load_samples_for_coverage(conn, log_id)
+        plan = build_coverage_plan(audit, samples)
+        for c in cs:
+            c["coverage"] = assess_cycle_coverage(
+                samples,
+                _index_at(samples, c["start_t"]),
+                _index_at(samples, c["end_t"]),
+                plan,
+                no_audit_reason="该日志样本缺少 CSV 原始行号，"
+                                "无法关联审计证据评估容量可信覆盖")
+
+
+def _index_at(samples: list[Sample], t: float) -> int:
+    """循环边界（端点时刻）-> 时间序样本索引（容差匹配，找不到则最近）。"""
+    best, best_i = None, 0
+    for k, s in enumerate(samples):
+        d = abs(s.t - t)
+        if best is None or d < best:
+            best, best_i = d, k
+    return best_i
 
 
 # ---------------------------------------------------------------- 电池 CRUD
@@ -170,7 +226,9 @@ def import_log(bid: int, file: UploadFile = File(...)):
         except CsvFormatError as exc:
             raise HTTPException(422, f"CSV 解析失败: {exc}")
 
-        cycles = detect_cycles(samples)
+        cycles = detect_cycles(
+            samples,
+            coverage_plan=build_coverage_plan(meta["quality_audit"], samples))
         for cyc in cycles:
             cyc.flags = evaluate_cycle(
                 cyc, battery["rated_capacity_ah"],
@@ -208,8 +266,8 @@ def import_log(bid: int, file: UploadFile = File(...)):
                 " end_t, start_iso, duration_s, capacity_ah, energy_wh,"
                 " avg_current_a, min_voltage, max_voltage, max_temp_c,"
                 " temp_rise_c, ir_mohm, closed, flags, cell_count,"
-                " cell_max_diff_v, cell_sustain_s, cell_intervals)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cell_max_diff_v, cell_sustain_s, cell_intervals, coverage)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (log_id, bid, cyc.seq, cyc.kind, cyc.start_t, cyc.end_t,
                  start_iso, cyc.duration_s, cyc.capacity_ah, cyc.energy_wh,
                  cyc.avg_current_a, cyc.min_voltage, cyc.max_voltage,
@@ -217,7 +275,9 @@ def import_log(bid: int, file: UploadFile = File(...)):
                  1 if cyc.closed else 0, json.dumps(cyc.flags,
                                                     ensure_ascii=False),
                  cyc.cell_count, cyc.cell_max_diff_v, cyc.cell_sustain_s,
-                 json.dumps(cyc.cell_intervals, ensure_ascii=False)))
+                 json.dumps(cyc.cell_intervals, ensure_ascii=False),
+                 json.dumps(cyc.coverage, ensure_ascii=False)
+                 if cyc.coverage is not None else None))
         conn.commit()
         log = dict(conn.execute("SELECT * FROM logs WHERE id=?",
                                 (log_id,)).fetchone())
@@ -274,11 +334,13 @@ def get_log(log_id: int, max_points: int = 3000):
             c["flags"] = json.loads(c["flags"])
             c["closed"] = bool(c["closed"])
             c["cell_intervals"] = json.loads(c["cell_intervals"])
+            c["coverage"] = json.loads(c["coverage"]) if c["coverage"] else None
+        audit = json.loads(log["quality_audit"]) if log["quality_audit"] else None
+        _attach_legacy_coverage(conn, cycles, {log_id: audit})
         log_dict = dict(log)
         log_dict["cell_info"] = (json.loads(log_dict["cell_info"])
                                  if log_dict["cell_info"] else None)
-        log_dict["quality_audit"] = (json.loads(log_dict["quality_audit"])
-                                     if log_dict["quality_audit"] else None)
+        log_dict["quality_audit"] = audit
         return {"log": log_dict, "samples": samples, "cycles": cycles}
     finally:
         conn.close()
@@ -308,6 +370,7 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         c["flags"] = json.loads(c["flags"])
         c["closed"] = bool(c["closed"])
         c["cell_intervals"] = json.loads(c["cell_intervals"])
+        c["coverage"] = json.loads(c["coverage"]) if c["coverage"] else None
         cycles.append(c)
     log_count = conn.execute(
         "SELECT COUNT(*) AS n FROM logs WHERE battery_id=?", (bid,)).fetchone()["n"]
@@ -316,19 +379,60 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         "SELECT id, filename, imported_at, row_count, quality_audit"
         " FROM logs WHERE battery_id=? ORDER BY id", (bid,)).fetchall()
     log_audits = []
+    audits_by_log: dict[int, Optional[dict]] = {}
     for r in log_rows:
         audit = json.loads(r["quality_audit"]) if r["quality_audit"] else None
+        audits_by_log[r["id"]] = audit
         log_audits.append({
             "log_id": r["id"], "filename": r["filename"],
             "imported_at": r["imported_at"], "row_count": r["row_count"],
             "quality_audit": audit,
         })
+    # 旧库放电循环无 coverage 时，按审计与原始行号惰性重算或标记无法评估
+    _attach_legacy_coverage(conn, cycles, audits_by_log)
     result = build_assessment(battery, cycles, log_count)
     result["battery"] = battery
     result["data_quality"] = _summarize_quality(log_audits)
+    result["capacity_coverage"] = _summarize_capacity_coverage(cycles)
     result["logs"] = log_audits
     result["generated_at"] = _now_iso()
     return result
+
+
+def _summarize_capacity_coverage(cycles: list[dict]) -> dict:
+    """跨日志汇总放电容量可信覆盖：低覆盖循环与无法评估循环清单。"""
+    dis = [c for c in cycles if c["kind"] == "discharge"]
+    assessable, low, unknown = [], [], []
+    for c in dis:
+        cov = c.get("coverage")
+        entry = {"log_id": c["log_id"], "cycle_seq": c["seq"],
+                 "capacity_ah": c["capacity_ah"],
+                 "start_iso": c.get("start_iso")}
+        if not cov or cov.get("status") == STATUS_UNASSESSED:
+            entry["reason"] = (cov or {}).get(
+                "reason", "无导入前质量审计记录，无法评估")
+            unknown.append(entry)
+            continue
+        entry["trusted_time_ratio"] = cov.get("trusted_time_ratio")
+        entry["trusted_capacity_ah"] = cov.get("trusted_capacity_ah")
+        entry["suspicious_capacity_ah"] = cov.get("suspicious_capacity_ah")
+        entry["suspicious_duration_s"] = cov.get("suspicious_duration_s")
+        assessable.append(entry)
+        if cov.get("trusted_time_ratio", 0.0) < LOW_COVERAGE_TIME_RATIO:
+            entry["reasons"] = sorted({
+                code for seg in cov.get("suspicious_segments", [])
+                for code in seg.get("reason_codes", [])})
+            low.append(entry)
+    ratios = [c["coverage"]["trusted_time_ratio"] for c in dis
+              if c.get("coverage") and c["coverage"].get("assessable")]
+    return {
+        "threshold": LOW_COVERAGE_TIME_RATIO,
+        "discharge_cycles": len(dis),
+        "assessable_cycles": len(assessable),
+        "low_coverage_cycles": low,
+        "unassessed_cycles": unknown,
+        "min_trusted_time_ratio": min(ratios) if ratios else None,
+    }
 
 
 def _summarize_quality(log_audits: list[dict]) -> dict:

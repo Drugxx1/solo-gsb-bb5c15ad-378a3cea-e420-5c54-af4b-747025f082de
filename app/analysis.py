@@ -60,6 +60,7 @@ class Cycle:
     cell_max_diff_v: Optional[float] = None  # 循环内单体最大压差 V
     cell_sustain_s: float = 0.0  # 连续超差（满足时长）区间累计持续 s
     cell_intervals: list = field(default_factory=list)  # 持续超差区间与证据
+    coverage: Optional[dict] = None  # 放电容量可信覆盖评估（充电循环为 None）
     flags: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
@@ -311,10 +312,18 @@ def evaluate_cell_balance(cyc: Cycle) -> list[dict]:
 def detect_cycles(samples: list[Sample],
                   min_cycle_s: float = MIN_CYCLE_S,
                   min_rest_s: float = MIN_REST_S,
-                  rest_current_a: Optional[float] = None) -> list[Cycle]:
-    """状态机主入口：样本序列 -> 循环列表。"""
+                  rest_current_a: Optional[float] = None,
+                  coverage_plan: Optional[list] = None,
+                  coverage_no_audit_reason: Optional[str] = None) -> list[Cycle]:
+    """状态机主入口：样本序列 -> 循环列表。
+
+    coverage_plan 非 None 时对放电循环追加容量可信覆盖评估（由
+    ``coverage.build_coverage_plan`` 从质量审计构建）。
+    """
     if len(samples) < 2:
         return []
+    # 延迟导入避免模块加载循环（coverage 模块加载时反向引用本模块的 Sample）
+    from .coverage import assess_cycle_coverage
     peak = max(abs(s.i) for s in samples)
     thr = rest_current_a if rest_current_a is not None else max(
         REST_CURRENT_FLOOR_A, REST_CURRENT_RATIO * peak)
@@ -332,6 +341,11 @@ def detect_cycles(samples: list[Sample],
         cyc.cell_max_diff_v = cell["max_diff"]
         cyc.cell_sustain_s = cell["sustain_s"]
         cyc.cell_intervals = cell["intervals"]
+        if kind == "D":
+            cyc.coverage = assess_cycle_coverage(
+                samples, a, b, coverage_plan,
+                no_audit_reason=(coverage_no_audit_reason
+                                 or "该日志无导入前质量审计记录，无法评估容量可信覆盖"))
         cycles.append(cyc)
     return cycles
 
@@ -484,7 +498,10 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
               "max_temp_c": c["max_temp_c"],
               "cell_max_diff_v": (round(c["cell_max_diff_v"], 4)
                                   if c.get("cell_max_diff_v") is not None else None),
-              "cell_sustain_s": round(c.get("cell_sustain_s", 0.0), 3)}
+              "cell_sustain_s": round(c.get("cell_sustain_s", 0.0), 3),
+              "coverage_status": (c.get("coverage") or {}).get("status"),
+              "trusted_time_ratio": (c.get("coverage") or {}).get(
+                  "trusted_time_ratio")}
              for i, c in enumerate(dis)]
 
     parts = [

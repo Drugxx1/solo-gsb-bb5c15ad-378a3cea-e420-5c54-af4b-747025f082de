@@ -69,7 +69,8 @@ CREATE TABLE IF NOT EXISTS cycles (
     cell_count     INTEGER NOT NULL DEFAULT 0,
     cell_max_diff_v REAL,
     cell_sustain_s REAL NOT NULL DEFAULT 0,
-    cell_intervals TEXT NOT NULL DEFAULT '[]'
+    cell_intervals TEXT NOT NULL DEFAULT '[]',
+    coverage       TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_cycles_battery ON cycles(battery_id, id);
 """
@@ -90,6 +91,8 @@ _MIGRATIONS = [
      "ALTER TABLE logs ADD COLUMN quality_audit TEXT"),
     ("samples", "line_no",
      "ALTER TABLE samples ADD COLUMN line_no INTEGER"),
+    ("cycles", "coverage",
+     "ALTER TABLE cycles ADD COLUMN coverage TEXT"),
 ]
 
 
