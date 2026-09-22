@@ -11,6 +11,8 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import NamedTuple, Optional
 
+from .coverage import LOW_COVERAGE_RATIO, STATUS_OK
+
 # ---- 可调阈值 ----
 REST_CURRENT_RATIO = 0.03    # 静置电流阈值 = 峰值电流的 3%
 REST_CURRENT_FLOOR_A = 0.05  # 静置电流阈值下限 (A)
@@ -327,6 +329,9 @@ def detect_cycles(samples: list[Sample],
         cyc = _build_cycle(samples, a, b, kind, thr)
         cyc.seq = len(cycles) + 1
         cyc.closed = si < len(segs) - 1   # 日志结束时仍处于充/放电 -> 未闭合
+        # 内部使用：该循环在时间排序样本序列中的下标区间，供容量可信覆盖评估
+        # 关联审计证据（普通实例属性，不是 dataclass 字段，不会被 asdict 序列化）
+        cyc.span = (a, b)
         cell = _cell_stats(samples, a, b)  # 单体分析独立于总压状态机，失败不影响主结果
         cyc.cell_count = cell["cell_count"]
         cyc.cell_max_diff_v = cell["max_diff"]
@@ -508,6 +513,20 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
     n_warn = sum(1 for f in flags if f["severity"] == "warning")
     parts.append(f"判定标记：严重 {n_crit} 条、警告 {n_warn} 条；综合健康等级：{GRADE_LABELS[grade]}。")
 
+    # 放电容量可信覆盖（独立于健康判定：不修改容量/SOH/健康等级，
+    # 可信容量只是可信时段的部分积分，不代表真实总容量）
+    coverage = _build_coverage_summary(dis)
+    if dis:
+        parts.append(
+            f"放电容量可信覆盖：已评估 {coverage['assessed_cycles']} 个，"
+            f"其中全可信 {coverage['fully_trusted_cycles']} 个、"
+            f"含可疑段 {coverage['suspicious_cycles']} 个（低覆盖 "
+            f"{coverage['low_coverage_cycles']} 个，可信时长占比阈值 "
+            f"{LOW_COVERAGE_RATIO * 100:.0f}%），"
+            f"{coverage['unavailable_cycles']} 个因缺少审计记录无法评估"
+            f"（不按全可信处理）；可信容量仅为可信时段的部分积分，"
+            f"不代表真实总容量。")
+
     return {
         "summary": {
             "total_logs": log_count,
@@ -536,4 +555,57 @@ def build_assessment(battery: dict, cycles: list[dict], log_count: int) -> dict:
         "flags": flags,
         "trend": trend,
         "cycles": cycles,
+        "coverage": coverage,
+    }
+
+
+def _build_coverage_summary(dis: list[dict]) -> dict:
+    """跨放电循环汇总容量可信覆盖评估结果（仅统计，不参与健康等级判定）。"""
+    assessed_pairs: list[tuple[dict, dict]] = []   # (cycle, coverage)
+    unavailable: list[dict] = []
+    for c in dis:
+        cov = c.get("coverage")
+        if cov and cov.get("status") == STATUS_OK:
+            assessed_pairs.append((c, cov))
+        else:
+            unavailable.append(c)
+
+    suspicious_pairs = [(c, cov) for c, cov in assessed_pairs
+                        if cov["suspicious_duration_s"] > 0]
+    low_pairs = [(c, cov) for c, cov in suspicious_pairs
+                 if (cov.get("trusted_duration_ratio") is not None
+                     and cov["trusted_duration_ratio"] < LOW_COVERAGE_RATIO)]
+
+    def detail(c: dict, cov: dict) -> dict:
+        return {
+            "log_id": c["log_id"], "cycle_seq": c["seq"],
+            "start_iso": c.get("start_iso"),
+            "trusted_duration_ratio": cov.get("trusted_duration_ratio"),
+            "trusted_capacity_ah": cov.get("trusted_capacity_ah"),
+            "suspicious_capacity_ah": cov.get("suspicious_capacity_ah"),
+            "trusted_duration_s": cov.get("trusted_duration_s"),
+            "suspicious_duration_s": cov.get("suspicious_duration_s"),
+            "low_coverage": (cov.get("trusted_duration_ratio") is not None
+                             and cov["trusted_duration_ratio"] < LOW_COVERAGE_RATIO),
+            "suspicious_segments": cov.get("suspicious_segments", []),
+        }
+
+    ratios = [cov["trusted_duration_ratio"] for _, cov in assessed_pairs
+              if cov["trusted_duration_ratio"] is not None]
+    return {
+        "discharge_cycles": len(dis),
+        "assessed_cycles": len(assessed_pairs),
+        "unavailable_cycles": len(unavailable),
+        "fully_trusted_cycles": len(assessed_pairs) - len(suspicious_pairs),
+        "suspicious_cycles": len(suspicious_pairs),
+        "low_coverage_cycles": len(low_pairs),
+        "low_coverage_threshold": LOW_COVERAGE_RATIO,
+        "min_trusted_duration_ratio": round(min(ratios), 4) if ratios else None,
+        "suspicious_detail": [detail(c, cov) for c, cov in suspicious_pairs],
+        "unavailable_detail": [
+            {"log_id": c["log_id"], "cycle_seq": c["seq"],
+             "start_iso": c.get("start_iso")} for c in unavailable],
+        "note": "可信容量仅为剔除可疑段后可信时段的部分积分，不代表电池真实总容量；"
+                "容量、SOH 与健康等级仍基于完整积分，不受本评估影响。"
+                "无审计记录的旧日志标记为无法评估，不按全可信处理。",
     }

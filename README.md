@@ -20,18 +20,30 @@
 - **导入前数据质量审计**：解析时保留 CSV 原始行号，在时间排序之前检查时间戳乱序、
   重复时间、异常采样间隔（缺口/过密）与电压/电流/温度的稳健离群点；相邻问题自动
   合并为质量区段，审计证据随导入与导出 JSON 保留，**绝不阻断可解析行的循环分析**
-- **JSON 导出**：按电池一键导出完整评估结果（含全部质量审计证据）
+- **放电容量可信覆盖**：以原始行号把质量审计与样本关联，对每个放电循环逐段重算
+  梯形积分；**电流离群点相邻区间**与**采样缺口区间**列为可疑段、其余为可信段，
+  分别给出容量、累计时长与可信时长占比，并在循环明细中列出可疑段原始行号与原因；
+  旧库无审计记录时标记"无法评估"而非全可信。可信容量只是可信时段的部分积分，
+  **不是电池真实总容量**，原有容量、SOH 与健康等级保持不变
+- **JSON 导出**：按电池一键导出完整评估结果（含全部质量审计证据与可信覆盖汇总）
 
 ## 快速开始
 
-### Docker Compose（推荐）
+### Docker Compose（推荐，一条命令启动）
+
+无需任何手工配置，在仓库根目录执行：
 
 ```bash
-docker compose up --build
+docker compose up --build -d
 ```
 
-访问 <http://localhost:8000>。SQLite 数据库持久化在 `battery-data` 卷中，
-容器启动时自动完成依赖安装（构建阶段）与 SQLite 初始化（应用启动钩子）。
+随后浏览器访问 <http://localhost:8000>（容器内 Web 端口固定为 `8000`，
+并通过 `docker-compose.yml` 的 `ports: "8000:8000"` 映射到宿主机；
+如需改宿主机端口，把左侧端口改成如 `"8080:8000"` 即可）。
+SQLite 数据库文件持久化在 `battery-data` 卷（容器内路径
+`/app/data/battery.db`，由环境变量 `BATTERY_DB` 指定），镜像构建阶段完成
+依赖安装，容器启动钩子自动建表并为旧库补列。停止用 `docker compose down`
+（加 `-v` 会同时删除数据卷）。
 
 ### 本地运行
 
@@ -55,10 +67,14 @@ python3 scripts/generate_sample.py   # 生成 sample_data/sample_flight_1.csv �
 缺值行被跳过）。
 
 第三份 `sample_flight_3_quality.csv` 用于演示**导入前数据质量审计**：静置段电流、
-放电段电压与温度各有一个孤立坏点（稳健离群点），另有一次相邻行时间戳交换（乱序）、
-一行重复时间戳与一处 30 s 采样缺口。上传后日志详情页的"导入前数据质量审计"面板会
-逐区段给出类型、起止行（CSV 物理行号）、时间范围、受影响字段与统计证据，可用类型
-按钮筛选；尽管存在上述问题，放电/充电循环仍被正常识别。
+放电段电流、放电段电压与温度各有一个孤立坏点（稳健离群点），另有一次相邻行时间戳
+交换（乱序）、一行重复时间戳与一处 30 s 采样缺口。上传后日志详情页的"导入前数据
+质量审计"面板会逐区段给出类型、起止行（CSV 物理行号）、时间范围、受影响字段与统计
+证据，可用类型按钮筛选；尽管存在上述问题，放电/充电循环仍被正常识别。放电循环的
+**容量可信覆盖**列同时把放电段电流坏点（第 501~503 行，离群点前后两个梯形区间）
+与 30 s 采样缺口（第 401~402 行）列为可疑段，分别给出可信/可疑容量、时长与可信
+时长占比；评估页"放电容量可信覆盖"汇总低覆盖循环，导出 JSON 的 `coverage` 字段
+保留同样的汇总与逐段证据。
 
 ## CSV 格式
 
@@ -104,9 +120,9 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 | GET / PATCH / DELETE | `/api/batteries/{id}` | 查询 / 修改 / 删除电池 |
 | POST | `/api/batteries/{id}/logs` | 上传 CSV 并完成质量审计 + 循环分析（multipart） |
 | GET | `/api/batteries/{id}/logs` | 该电池的日志列表（含每日志紧凑质量摘要 `quality`） |
-| GET / DELETE | `/api/logs/{id}` | 日志详情（样本含原始行号 + 完整审计 + 循环）/ 删除 |
-| GET | `/api/batteries/{id}/assessment` | 汇总评估（摘要、质量汇总 `data_quality`、标记、趋势、循环与各日志审计） |
-| GET | `/api/batteries/{id}/export` | 下载评估 JSON 文件（保留全部审计证据） |
+| GET / DELETE | `/api/logs/{id}` | 日志详情（样本含原始行号 + 完整审计 + 循环含 `coverage` 可信覆盖）/ 删除 |
+| GET | `/api/batteries/{id}/assessment` | 汇总评估（摘要、质量汇总 `data_quality`、放电容量可信覆盖 `coverage`、标记、趋势、循环与各日志审计） |
+| GET | `/api/batteries/{id}/export` | 下载评估 JSON 文件（保留全部审计证据与可信覆盖汇总） |
 
 交互式 API 文档：<http://localhost:8000/docs>
 
@@ -130,6 +146,8 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
 | 质量审计-采样缺口 | 间隔 ≥ 3× 中位数且 ≥ 2 s |
 | 质量审计-过密采样 | 间隔 ≤ 中位数 1/3 且 ≤ 0.5 s |
 | 质量审计-区段合并 | 同类相邻问题行号差 ≤ 2 行 |
+| 容量可信覆盖-可疑段 | 电流离群点前后相邻梯形区间；采样缺口两侧样本间的梯形区间 |
+| 容量可信覆盖-低覆盖 | 可信时长占比 < 95% 的放电循环（`LOW_COVERAGE_RATIO`，可调） |
 
 **单体失衡判定**：对每个已识别循环，取该行各单体电压的最大压差
 `max(cell) − min(cell)`；按**时间戳累计**（非采样点数，采样间隔不规则同样适用）
@@ -201,16 +219,66 @@ time,voltage,current,temperature,cell1_voltage,cell2_voltage,cell3_voltage,cell4
   保留每份日志的完整区段与逐条证据。
 
 旧版 SQLite 数据库在应用启动时自动补列（`logs.quality_audit`、
-`samples.line_no`），历史日志的审计字段为空，页面显示"未审计"，不影响使用。
+`samples.line_no`、`cycles.coverage`），历史日志的审计字段为空，页面显示"未审计"，
+放电循环的容量可信覆盖显示"无法评估"，不影响使用。
+
+## 放电容量可信覆盖
+
+容量可信覆盖评估（`app/coverage.py`）回答"这次放电循环的容量积分有多可信"，
+在导入时随循环分析一次计算，结果存于 `cycles.coverage`：
+
+1. 每个样本携带其 CSV **原始行号**（表头为第 1 行），质量审计区段也以原始行号
+   描述位置，两者按行号直接关联，不受时间戳乱序后排序的影响。
+2. 对每个放电循环**逐段（逐梯形积分区间）重算库仑积分**，按审计证据把每个梯形
+   区间划分为：
+   - **可疑段**：
+     - `current_outlier` 电流离群点相邻区间——坏点电流直接参与其前后两个梯形
+       的面积，这两段积分不可信；
+     - `interval_gap` 采样缺口区间——缺口两侧样本之间没有采样，梯形面积只是
+       对缺失数据的粗略近似。
+   - **可信段**：其余全部梯形区间。
+   - 电压/温度离群点、过密采样、乱序/重复不影响电流积分，不列为可疑段。
+3. 分别给出可信段与可疑段的**容量（Ah）、累计时长（s）与可信时长占比**
+   （另有可信容量占比）；可信 + 可疑的积分之和等于原有循环容量。
+4. **明细截断时保守处理**：审计区段逐条证据超过 20 条时只保留前 20 条
+   （`details_truncated=true`），此时无法确认全部问题行号，覆盖评估将该区段
+   `line_start..line_end` 覆盖的整段行范围（电流离群点再向两侧各扩一个梯形
+   区间）一律按可疑处理，宁可多标不可漏标。
+5. **旧库兼容**：历史导入没有质量审计记录，放电循环的覆盖结果为
+   `{"status": "unavailable"}`，页面与导出中标记"无法评估"，**绝不视作全可信**。
+6. 仅放电循环参与评估；充电循环 `coverage` 为 `null`。
+
+输出字段（每个放电循环的 `coverage`）：
+
+- `status`：`ok` / `unavailable`（无审计记录）
+- `trusted_capacity_ah` / `trusted_duration_s`：可信段容量与累计时长
+- `suspicious_capacity_ah` / `suspicious_duration_s`：可疑段容量与累计时长
+- `trusted_capacity_ratio` / `trusted_duration_ratio`：可信容量/时长占比
+- `suspicious_segments[]`：连续可疑段明细，含 `reasons` / `reason_labels`、
+  覆盖样本的 `line_start` / `line_end`、证据行号 `lines`（每段最多 20 个，
+  超出时 `lines_truncated=true`）、`start_t` / `end_t` / `duration_s` /
+  `capacity_ah`
+
+**重要语义**：`trusted_capacity_ah` 只是"可信时段内的部分积分"，**不是电池真实
+总容量**（缺口与坏点造成的积分偏差无法恢复）；评估页与导出均附带该说明。
+原有 `capacity_ah`、SOH、容量趋势与健康等级始终基于完整积分，**不因覆盖评估
+而改变**，也不生成健康判定标记。
+
+评估接口与导出 JSON 的顶层 `coverage` 为跨日志汇总：已评估/全可信/含可疑段/
+低覆盖/无法评估循环数、最低可信时长占比、`suspicious_detail`（每个含可疑段
+循环的占比、容量时长与逐段原始行号/原因）、`unavailable_detail`（无审计记录
+循环）与固定说明 `note`。评估页"放电容量可信覆盖"面板展示同样的指标与明细，
+日志详情循环表的"容量可信覆盖"列直接列出每个放电循环的可疑段原始行号与原因。
 
 ## 项目结构
 
 ```
 app/
   main.py        FastAPI 路由与启动钩子（启动时初始化 SQLite）
-  database.py    SQLite 连接与建表（含旧库自动迁移：质量审计列、样本原始行号列）
+  database.py    SQLite 连接与建表（含旧库自动迁移：质量审计列、样本原始行号列、循环覆盖列）
   analysis.py    状态机循环识别、库仑积分、内阻估算、单体压差连续性判定、判定与汇总
   audit.py       导入前质量审计（乱序/重复/异常间隔 + 局部残差 MAD 稳健离群点、区段合并）
+  coverage.py    放电容量可信覆盖（行号关联审计证据、逐梯形重算、可信/可疑段划分与低覆盖汇总）
   importer.py    CSV 解析（列名别名、单体列识别、分隔符嗅探、时间归一化、排序前审计）
   static/        原生前端（index.html / app.js / style.css）
 scripts/generate_sample.py   演示数据生成器（含质量缺陷样例 sample_flight_3_quality.csv）

@@ -71,6 +71,8 @@
         <canvas id="trend-chart" height="200"></canvas>
         <h4>导入数据质量摘要</h4>
         <div id="quality-summary"></div>
+        <h4>放电容量可信覆盖</h4>
+        <div id="coverage-summary"></div>
         <h4>判定标记 <span class="muted" id="flag-count"></span></h4>
         <ul id="flag-list" class="flags"></ul>
       </div>
@@ -100,6 +102,7 @@
         <table id="cycles-table">
           <thead><tr>
             <th>#</th><th>类型</th><th>开始</th><th>时长</th><th>容量 (Ah)</th>
+            <th>容量可信覆盖</th>
             <th>能量 (Wh)</th><th>均流 (A)</th><th>电压范围 (V)</th>
             <th>最高温 (°C)</th><th>温升 (°C)</th><th>内阻 (mΩ)</th>
             <th>单体压差</th><th>状态</th>

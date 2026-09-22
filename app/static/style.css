@@ -232,3 +232,42 @@ canvas { width: 100%; background: #121829; border-radius: 8px; }
   max-height: 220px; overflow: auto;
 }
 .qlegend .dot { vertical-align: middle; }
+
+/* ---------------- 放电容量可信覆盖 ---------------- */
+.covcell { text-align: left; min-width: 170px; }
+.cov-wrap { display: flex; flex-direction: column; gap: 2px; align-items: flex-start; }
+.cov-sub { margin-left: 6px; white-space: nowrap; }
+.cov-seg {
+  font-size: 11px;
+  color: #b8c6e3;
+  background: #121829;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  padding: 1px 6px;
+  margin-top: 2px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.cov-list { list-style: none; padding: 0; margin: 8px 0; }
+.cov-list li {
+  border-left: 3px solid var(--warn);
+  background: #121829;
+  padding: 8px 12px;
+  border-radius: 0 6px 6px 0;
+  margin-bottom: 8px;
+  font-size: 13px;
+  line-height: 1.7;
+}
+.cov-list li.critical { border-left-color: var(--crit); }
+.cov-list .badge {
+  display: inline-block;
+  font-size: 11px;
+  padding: 1px 7px;
+  border-radius: 10px;
+  margin-right: 8px;
+  background: var(--warn);
+  color: #08111f;
+  font-weight: 700;
+}
+.cov-list li.critical .badge { background: var(--crit); color: #fff; }
+.cov-segs { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }

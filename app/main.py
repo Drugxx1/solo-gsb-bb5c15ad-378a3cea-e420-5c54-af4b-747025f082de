@@ -14,6 +14,7 @@ from urllib.parse import quote
 
 from .analysis import (build_assessment, detect_cycles, evaluate_cycle,
                        evaluate_cell_balance)
+from .coverage import assess_discharge_coverage, unavailable_coverage
 from .database import get_conn, init_db
 from .importer import CsvFormatError, decode_text, parse_flight_csv
 
@@ -75,6 +76,17 @@ def _quality_brief(audit: Optional[str]) -> Optional[dict]:
         "affected_fields": data.get("affected_fields", []),
         "skipped_rows": data.get("skipped_rows", 0),
     }
+
+
+def _load_coverage(raw: Optional[str], kind: str) -> Optional[dict]:
+    """解析 cycles.coverage：旧库无审计记录的放电循环标记为无法评估。
+
+    充电循环不做该评估（NULL）。放电循环若列为 NULL（旧版导入、无审计
+    记录），显式返回 unavailable 占位，绝不被前端视作全可信。
+    """
+    if raw:
+        return json.loads(raw)
+    return unavailable_coverage() if kind == "discharge" else None
 
 
 # ---------------------------------------------------------------- 电池 CRUD
@@ -171,11 +183,18 @@ def import_log(bid: int, file: UploadFile = File(...)):
             raise HTTPException(422, f"CSV 解析失败: {exc}")
 
         cycles = detect_cycles(samples)
+        coverage_by_seq: dict[int, Optional[dict]] = {}
         for cyc in cycles:
             cyc.flags = evaluate_cycle(
                 cyc, battery["rated_capacity_ah"],
                 battery["safe_voltage_min"], battery["safe_voltage_max"])
             cyc.flags += evaluate_cell_balance(cyc)
+            # 放电容量可信覆盖：以原始行号关联审计证据，逐段重算梯形积分。
+            # 容量/SOH/健康等级仍使用完整积分，覆盖评估仅作可信度描述。
+            if cyc.kind == "discharge":
+                ca, cb = cyc.span
+                coverage_by_seq[cyc.seq] = assess_discharge_coverage(
+                    samples, ca, cb, meta["quality_audit"])
 
         cur = conn.execute(
             "INSERT INTO logs(battery_id, filename, imported_at, start_time,"
@@ -208,8 +227,8 @@ def import_log(bid: int, file: UploadFile = File(...)):
                 " end_t, start_iso, duration_s, capacity_ah, energy_wh,"
                 " avg_current_a, min_voltage, max_voltage, max_temp_c,"
                 " temp_rise_c, ir_mohm, closed, flags, cell_count,"
-                " cell_max_diff_v, cell_sustain_s, cell_intervals)"
-                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                " cell_max_diff_v, cell_sustain_s, cell_intervals, coverage)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (log_id, bid, cyc.seq, cyc.kind, cyc.start_t, cyc.end_t,
                  start_iso, cyc.duration_s, cyc.capacity_ah, cyc.energy_wh,
                  cyc.avg_current_a, cyc.min_voltage, cyc.max_voltage,
@@ -217,7 +236,9 @@ def import_log(bid: int, file: UploadFile = File(...)):
                  1 if cyc.closed else 0, json.dumps(cyc.flags,
                                                     ensure_ascii=False),
                  cyc.cell_count, cyc.cell_max_diff_v, cyc.cell_sustain_s,
-                 json.dumps(cyc.cell_intervals, ensure_ascii=False)))
+                 json.dumps(cyc.cell_intervals, ensure_ascii=False),
+                 json.dumps(coverage_by_seq[cyc.seq], ensure_ascii=False)
+                 if coverage_by_seq.get(cyc.seq) else None))
         conn.commit()
         log = dict(conn.execute("SELECT * FROM logs WHERE id=?",
                                 (log_id,)).fetchone())
@@ -274,6 +295,7 @@ def get_log(log_id: int, max_points: int = 3000):
             c["flags"] = json.loads(c["flags"])
             c["closed"] = bool(c["closed"])
             c["cell_intervals"] = json.loads(c["cell_intervals"])
+            c["coverage"] = _load_coverage(c["coverage"], c["kind"])
         log_dict = dict(log)
         log_dict["cell_info"] = (json.loads(log_dict["cell_info"])
                                  if log_dict["cell_info"] else None)
@@ -308,6 +330,7 @@ def _build_battery_assessment(conn, bid: int) -> dict:
         c["flags"] = json.loads(c["flags"])
         c["closed"] = bool(c["closed"])
         c["cell_intervals"] = json.loads(c["cell_intervals"])
+        c["coverage"] = _load_coverage(c["coverage"], c["kind"])
         cycles.append(c)
     log_count = conn.execute(
         "SELECT COUNT(*) AS n FROM logs WHERE battery_id=?", (bid,)).fetchone()["n"]
